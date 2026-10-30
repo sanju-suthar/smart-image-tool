@@ -1,0 +1,130 @@
+name: Build Smart Image Tool APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Generate Android project & custom Purple App Icon
+        run: |
+          # Backup your uploaded pubspec.yaml and lib/main.dart
+          cp pubspec.yaml /tmp/pubspec.yaml
+          cp lib/main.dart /tmp/main.dart
+
+          # Scaffold missing android/ folders automatically
+          flutter create --platforms=android --org com.smartimagetool --project-name smart_image_tool .
+
+          # Restore your custom pubspec.yaml and lib/main.dart
+          cp /tmp/pubspec.yaml pubspec.yaml
+          cp /tmp/main.dart lib/main.dart
+
+          # Set display name to "Smart Image Tool" in AndroidManifest.xml
+          sed -i 's/android:label="[^"]*"/android:label="Smart Image Tool"/g' android/app/src/main/AndroidManifest.xml
+
+          # Create Purple Minimal Camera & Resize App Icon automatically if assets/icon.png is not uploaded
+          mkdir -p assets
+          if [ ! -f assets/icon.png ]; then
+            python3 - << 'EOF'
+          import os, struct, zlib
+
+          def create_purple_camera_resize_icon(filename, size=512):
+              raw_data = bytearray()
+              center = size / 2.0
+              for y in range(size):
+                  raw_data.append(0)  # PNG filter byte
+                  for x in range(size):
+                      # Purple-to-Indigo diagonal gradient background
+                      t = (x + y) / (2.0 * size)
+                      r = int(142 * (1 - t) + 49 * t)
+                      g = int(36 * (1 - t) + 27 * t)
+                      b = int(170 * (1 - t) + 146 * t)
+
+                      # Distance from center for camera lens rings
+                      dx = x - center
+                      dy = y - center
+                      dist = (dx*dx + dy*dy) ** 0.5
+
+                      is_white = False
+                      # Outer camera lens circle
+                      if 105 <= dist <= 125:
+                          is_white = True
+                      # Inner camera lens circle
+                      elif 65 <= dist <= 80:
+                          is_white = True
+                      # Center lens reflection dot
+                      elif dist <= 22:
+                          is_white = True
+
+                      # 4 Corner Resize/Crop brackets
+                      margin = 95
+                      arm = 70
+                      thick = 18
+                      # Top-Left bracket
+                      if (margin <= x <= margin + arm and margin <= y <= margin + thick) or \
+                         (margin <= x <= margin + thick and margin <= y <= margin + arm):
+                          is_white = True
+                      # Top-Right bracket
+                      if (size - margin - arm <= x <= size - margin and margin <= y <= margin + thick) or \
+                         (size - margin - thick <= x <= size - margin and margin <= y <= margin + arm):
+                          is_white = True
+                      # Bottom-Left bracket
+                      if (margin <= x <= margin + arm and size - margin - thick <= y <= size - margin) or \
+                         (margin <= x <= margin + thick and size - margin - arm <= y <= size - margin):
+                          is_white = True
+                      # Bottom-Right bracket
+                      if (size - margin - arm <= x <= size - margin and size - margin - thick <= y <= size - margin) or \
+                         (size - margin - thick <= x <= size - margin and size - margin - arm <= y <= size - margin):
+                          is_white = True
+
+                      if is_white:
+                          raw_data.extend((255, 255, 255, 255))
+                      else:
+                          raw_data.extend((r, g, b, 255))
+
+              def png_chunk(chunk_type, data):
+                  return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xffffffff)
+
+              ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+              idat = zlib.compress(bytes(raw_data), 9)
+              with open(filename, "wb") as f:
+                  f.write(b"\x89PNG\r\n\x1a\n")
+                  f.write(png_chunk(b"IHDR", ihdr))
+                  f.write(png_chunk(b"IDAT", idat))
+                  f.write(png_chunk(b"IEND", b""))
+
+          create_purple_camera_resize_icon("assets/icon.png", 512)
+          EOF
+          fi
+
+      - name: Install dependencies & Apply Launcher Icons
+        run: |
+          flutter pub get
+          dart run flutter_launcher_icons
+
+      - name: Build Release APK for Realme 6
+        run: flutter build apk --release --split-per-abi
+
+      - name: Upload Smart Image Tool APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Smart-Image-Tool-APK
+          path: build/app/outputs/flutter-apk/*.apk
