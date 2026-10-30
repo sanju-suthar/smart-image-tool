@@ -49,7 +49,10 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  // Always keep original bytes & latest full-resolution cropped bytes so resizing
+  // or compressing multiple times never degrades from a tiny intermediate image.
   Uint8List? _originalBytes;
+  Uint8List? _masterBytes;
   Uint8List? _processedBytes;
   int _origWidth = 0;
   int _origHeight = 0;
@@ -70,6 +73,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       setState(() {
         _originalBytes = bytes;
+        _masterBytes = bytes;
         _processedBytes = null;
         _origWidth = decoded.$1;
         _origHeight = decoded.$2;
@@ -153,11 +157,13 @@ class _HomeScreenState extends State<HomeScreen> {
       Navigator.of(context).push(
         MaterialPageRoute(
           builder: (_) => CropScreen(
-            imageBytes: _processedBytes ?? _originalBytes!,
+            imageBytes: _masterBytes ?? _originalBytes!,
             onCropped: (Uint8List croppedBytes) async {
               setState(() => _isBusy = true);
               final result = await compute(_encodeCleanJpg, croppedBytes);
               setState(() {
+                // Cropped image becomes the new high-res master for subsequent resize/compress
+                _masterBytes = result.$1;
                 _processedBytes = result.$1;
                 _outWidth = result.$2;
                 _outHeight = result.$3;
@@ -192,7 +198,8 @@ class _HomeScreenState extends State<HomeScreen> {
             return ResizeSheet(
               origWidth: _outWidth > 0 ? _outWidth : _origWidth,
               origHeight: _outHeight > 0 ? _outHeight : _origHeight,
-              onApply: (int w, int h) => _runResize(w, h),
+              onApply: (int w, int h, bool enhanceText) =>
+                  _runResize(w, h, enhanceText),
             );
           case ToolMode.crop:
             return const SizedBox.shrink();
@@ -204,7 +211,9 @@ class _HomeScreenState extends State<HomeScreen> {
   static (Uint8List, int, int) _encodeCleanJpg(Uint8List rawBytes) {
     final decoded = img.decodeImage(rawBytes);
     if (decoded == null) return (rawBytes, 0, 0);
-    final jpg = Uint8List.fromList(img.encodeJpg(decoded, quality: 92));
+    final jpg = Uint8List.fromList(
+      img.encodeJpg(decoded, quality: 98, chroma: img.JpegChroma.yuv444),
+    );
     return (jpg, decoded.width, decoded.height);
   }
 
@@ -212,7 +221,8 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_originalBytes == null) return;
     setState(() => _isBusy = true);
     try {
-      final source = _processedBytes ?? _originalBytes!;
+      // Use processedBytes if user already resized to specific dimensions, otherwise masterBytes
+      final source = _processedBytes ?? _masterBytes ?? _originalBytes!;
       final result = await compute(
         isIncrease ? _increaseSizeIsolate : _compressSizeIsolate,
         (source, targetBytes),
@@ -230,14 +240,15 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _runResize(int targetW, int targetH) async {
+  Future<void> _runResize(int targetW, int targetH, bool enhanceText) async {
     if (_originalBytes == null) return;
     setState(() => _isBusy = true);
     try {
-      final source = _processedBytes ?? _originalBytes!;
+      // Always resize from full-resolution masterBytes so repeated resizing stays crystal clear
+      final source = _masterBytes ?? _originalBytes!;
       final result = await compute(
         _resizeIsolate,
-        (source, targetW, targetH),
+        (source, targetW, targetH, enhanceText),
       );
       setState(() {
         _processedBytes = result.$1;
@@ -245,14 +256,86 @@ class _HomeScreenState extends State<HomeScreen> {
         _outHeight = result.$3;
         _isBusy = false;
       });
-      _showSnack('Resized to ${result.$2} x ${result.$3} px');
+      _showSnack(
+        'Resized to ${result.$2} × ${result.$3} px (${_formatBytes(result.$1.length)})',
+      );
     } catch (e) {
       setState(() => _isBusy = false);
       _showSnack('Resize error: $e');
     }
   }
 
-  // Isolate: Compress to target bytes
+  // Unsharp mask / clarity sharpening filter so downscaled text, signatures & photos stay crisp
+  static img.Image _applyCrispSharpen(
+    img.Image src, {
+    double amount = 0.55,
+    bool enhanceContrast = false,
+  }) {
+    img.Image working = src;
+    if (enhanceContrast) {
+      working = img.adjustColor(working, contrast: 1.12);
+    }
+    final blurred = img.gaussianBlur(working.clone(), radius: 1);
+    final out = working.clone();
+
+    for (int y = 0; y < working.height; y++) {
+      for (int x = 0; x < working.width; x++) {
+        final origP = working.getPixel(x, y);
+        final blurP = blurred.getPixel(x, y);
+
+        final num r = (origP.r + amount * (origP.r - blurP.r)).clamp(0, 255);
+        final num g = (origP.g + amount * (origP.g - blurP.g)).clamp(0, 255);
+        final num b = (origP.b + amount * (origP.b - blurP.b)).clamp(0, 255);
+
+        out.setPixelRgba(x, y, r.round(), g.round(), b.round(), origP.a.round());
+      }
+    }
+    return out;
+  }
+
+  // High-quality progressive step-down resize + 4:4:4 chroma + adaptive sharpening
+  static img.Image _highQualityResize(
+    img.Image src,
+    int targetW,
+    int targetH, {
+    bool enhanceText = true,
+  }) {
+    img.Image current = src;
+
+    // Multi-step progressive halving with area averaging prevents aliasing & broken strokes
+    while (current.width > targetW * 2 && current.height > targetH * 2) {
+      current = img.copyResize(
+        current,
+        width: math.max(targetW, current.width ~/ 2),
+        height: math.max(targetH, current.height ~/ 2),
+        interpolation: img.Interpolation.average,
+      );
+    }
+
+    final bool isDownscaling =
+        targetW < current.width || targetH < current.height;
+
+    current = img.copyResize(
+      current,
+      width: targetW,
+      height: targetH,
+      interpolation:
+          isDownscaling ? img.Interpolation.average : img.Interpolation.cubic,
+    );
+
+    if (isDownscaling || enhanceText) {
+      final double sharpenStrength = enhanceText ? 0.65 : 0.35;
+      current = _applyCrispSharpen(
+        current,
+        amount: sharpenStrength,
+        enhanceContrast: enhanceText,
+      );
+    }
+
+    return current;
+  }
+
+  // Isolate: Compress to target bytes while preserving maximum sharpness & YUV444 clarity
   static (Uint8List, int, int) _compressSizeIsolate((Uint8List, int) args) {
     final Uint8List srcBytes = args.$1;
     final int targetBytes = args.$2;
@@ -267,21 +350,24 @@ class _HomeScreenState extends State<HomeScreen> {
     for (int step = 0; step < 8; step++) {
       final img.Image working = scale == 1.0
           ? baseImage
-          : img.copyResize(
+          : _highQualityResize(
               baseImage,
-              width: math.max(32, (baseImage.width * scale).round()),
-              height: math.max(32, (baseImage.height * scale).round()),
-              interpolation: img.Interpolation.average,
+              math.max(48, (baseImage.width * scale).round()),
+              math.max(48, (baseImage.height * scale).round()),
+              enhanceText: true,
             );
 
-      int low = 5;
-      int high = 95;
+      int low = 15;
+      int high = 99;
       Uint8List? candidateUnderTarget;
 
       while (low <= high) {
         final int mid = (low + high) ~/ 2;
-        final Uint8List encoded =
-            Uint8List.fromList(img.encodeJpg(working, quality: mid));
+        final chromaMode =
+            mid >= 82 ? img.JpegChroma.yuv444 : img.JpegChroma.yuv420;
+        final Uint8List encoded = Uint8List.fromList(
+          img.encodeJpg(working, quality: mid, chroma: chromaMode),
+        );
         if (encoded.length <= targetBytes) {
           candidateUnderTarget = encoded;
           low = mid + 1;
@@ -297,17 +383,17 @@ class _HomeScreenState extends State<HomeScreen> {
         break;
       }
 
-      scale *= 0.72;
+      scale *= 0.78;
     }
 
     if (bestFit == null) {
-      final tiny = img.copyResize(baseImage, width: 120);
-      bestFit = Uint8List.fromList(img.encodeJpg(tiny, quality: 5));
+      final tiny = _highQualityResize(baseImage, 120, 120, enhanceText: true);
+      bestFit = Uint8List.fromList(img.encodeJpg(tiny, quality: 10));
       bestW = tiny.width;
       bestH = tiny.height;
     }
 
-    // Pad with safe trailing bytes if user needs exact close match (within 1%)
+    // Pad with safe trailing bytes if user needs exact close match
     if (bestFit.length < targetBytes && (targetBytes - bestFit.length) > 512) {
       final padded = Uint8List(targetBytes);
       padded.setRange(0, bestFit.length, bestFit);
@@ -324,12 +410,12 @@ class _HomeScreenState extends State<HomeScreen> {
     img.Image? baseImage = img.decodeImage(srcBytes);
     if (baseImage == null) return (srcBytes, 0, 0);
 
-    Uint8List encoded =
-        Uint8List.fromList(img.encodeJpg(baseImage, quality: 100));
+    Uint8List encoded = Uint8List.fromList(
+      img.encodeJpg(baseImage, quality: 100, chroma: img.JpegChroma.yuv444),
+    );
     int outW = baseImage.width;
     int outH = baseImage.height;
 
-    // Upscale modestly if way below target size
     if (encoded.length < targetBytes ~/ 2 &&
         baseImage.width * baseImage.height < 4000 * 4000) {
       final up = img.copyResize(
@@ -338,7 +424,9 @@ class _HomeScreenState extends State<HomeScreen> {
         height: (baseImage.height * 1.5).round(),
         interpolation: img.Interpolation.cubic,
       );
-      final upEncoded = Uint8List.fromList(img.encodeJpg(up, quality: 100));
+      final upEncoded = Uint8List.fromList(
+        img.encodeJpg(up, quality: 100, chroma: img.JpegChroma.yuv444),
+      );
       if (upEncoded.length <= targetBytes) {
         encoded = upEncoded;
         outW = up.width;
@@ -356,21 +444,33 @@ class _HomeScreenState extends State<HomeScreen> {
     return (encoded, outW, outH);
   }
 
-  // Isolate: Resize to exact pixel width & height
-  static (Uint8List, int, int) _resizeIsolate((Uint8List, int, int) args) {
+  // Isolate: Resize to exact pixel width & height with YUV444 & Smart Sharpening
+  static (Uint8List, int, int) _resizeIsolate(
+    (Uint8List, int, int, bool) args,
+  ) {
     final Uint8List srcBytes = args.$1;
     final int targetW = math.max(1, math.min(8000, args.$2));
     final int targetH = math.max(1, math.min(8000, args.$3));
+    final bool enhanceText = args.$4;
+
     final img.Image? decoded = img.decodeImage(srcBytes);
     if (decoded == null) return (srcBytes, 0, 0);
 
-    final resized = img.copyResize(
+    final resized = _highQualityResize(
       decoded,
-      width: targetW,
-      height: targetH,
-      interpolation: img.Interpolation.cubic,
+      targetW,
+      targetH,
+      enhanceText: enhanceText,
     );
-    final jpg = Uint8List.fromList(img.encodeJpg(resized, quality: 92));
+
+    // Encode at 98% quality with YUV 4:4:4 (zero color subsampling blur on small text/signatures)
+    final jpg = Uint8List.fromList(
+      img.encodeJpg(
+        resized,
+        quality: 98,
+        chroma: img.JpegChroma.yuv444,
+      ),
+    );
     return (jpg, resized.width, resized.height);
   }
 
@@ -408,7 +508,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: Container(
                     height: 240,
                     decoration: BoxDecoration(
-                      color: colorScheme.surfaceContainerHighest.withOpacity(0.55),
+                      color:
+                          colorScheme.surfaceContainerHighest.withOpacity(0.55),
                       borderRadius: BorderRadius.circular(20),
                       border: Border.all(
                         color: colorScheme.primary.withOpacity(0.25),
@@ -434,16 +535,21 @@ class _HomeScreenState extends State<HomeScreen> {
                               ),
                               const SizedBox(height: 4),
                               Text(
-                                'Supports JPG, PNG, WEBP -> Exports Clean JPG',
+                                'Supports JPG, PNG, WEBP -> Exports HD JPG',
                                 style: Theme.of(context).textTheme.bodySmall,
                               ),
                             ],
                           )
                         : ClipRRect(
                             borderRadius: BorderRadius.circular(18),
-                            child: Image.memory(
-                              activeBytes,
-                              fit: BoxFit.contain,
+                            child: InteractiveViewer(
+                              minScale: 0.8,
+                              maxScale: 4.0,
+                              child: Image.memory(
+                                activeBytes,
+                                fit: BoxFit.contain,
+                                filterQuality: FilterQuality.high,
+                              ),
                             ),
                           ),
                   ),
@@ -473,7 +579,9 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                           const Icon(Icons.arrow_forward_rounded),
                           _StatColumn(
-                            label: _processedBytes == null ? 'CURRENT' : 'OUTPUT (JPG)',
+                            label: _processedBytes == null
+                                ? 'CURRENT'
+                                : 'OUTPUT (HD JPG)',
                             sizeText: _formatBytes(activeBytes!.length),
                             dimText: '$_outWidth × $_outHeight px',
                             highlight: _processedBytes != null,
@@ -507,6 +615,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         tooltip: 'Reset to Original',
                         onPressed: () {
                           setState(() {
+                            _masterBytes = _originalBytes;
                             _processedBytes = null;
                             _outWidth = _origWidth;
                             _outHeight = _origHeight;
@@ -552,13 +661,13 @@ class _HomeScreenState extends State<HomeScreen> {
                     _ToolCard(
                       icon: Icons.photo_size_select_large_rounded,
                       title: 'Resize Image',
-                      subtitle: 'By Pixel, %, Inch, or CM (with DPI)',
+                      subtitle: 'By Pixel, %, Inch, or CM (HD Sharp)',
                       onTap: () => _openToolSheet(ToolMode.resize),
                     ),
                     _ToolCard(
                       icon: Icons.crop_rotate_rounded,
                       title: 'Crop Image',
-                      subtitle: 'Freehand, 1:1, 4:3, 16:9 & Passport',
+                      subtitle: 'Freehand, 1:1, 4:3, 16:9 & Signature',
                       onTap: () => _openToolSheet(ToolMode.crop),
                     ),
                   ],
@@ -578,7 +687,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       children: [
                         CircularProgressIndicator(),
                         SizedBox(height: 14),
-                        Text('Processing JPG...'),
+                        Text('Processing HD JPG...'),
                       ],
                     ),
                   ),
@@ -751,7 +860,7 @@ class _TargetSizeSheetState extends State<TargetSizeSheet> {
           Text(
             widget.isIncrease
                 ? 'Enter the exact larger file size you want (e.g. 200 KB or 2 MB).'
-                : 'Enter the maximum file size you need (e.g. 50 KB).',
+                : 'Enter the maximum file size you need (e.g. 20 KB or 50 KB).',
             style: Theme.of(context).textTheme.bodyMedium,
           ),
           const SizedBox(height: 16),
@@ -823,7 +932,7 @@ enum ResizeUnit { px, percent, inch, cm }
 class ResizeSheet extends StatefulWidget {
   final int origWidth;
   final int origHeight;
-  final void Function(int width, int height) onApply;
+  final void Function(int width, int height, bool enhanceText) onApply;
 
   const ResizeSheet({
     super.key,
@@ -839,6 +948,7 @@ class ResizeSheet extends StatefulWidget {
 class _ResizeSheetState extends State<ResizeSheet> {
   ResizeUnit _unit = ResizeUnit.px;
   bool _lockAspect = true;
+  bool _enhanceText = true;
   late TextEditingController _wCtrl;
   late TextEditingController _hCtrl;
   final TextEditingController _dpiCtrl = TextEditingController(text: '300');
@@ -878,10 +988,20 @@ class _ResizeSheetState extends State<ResizeSheet> {
     });
   }
 
+  void _onDpiChanged(String _) {
+    setState(() {});
+  }
+
   void _onWidthChanged(String value) {
-    if (!_lockAspect || _updatingFields) return;
+    if (!_lockAspect || _updatingFields) {
+      setState(() {});
+      return;
+    }
     final w = double.tryParse(value);
-    if (w == null || w <= 0) return;
+    if (w == null || w <= 0) {
+      setState(() {});
+      return;
+    }
     _updatingFields = true;
     if (_unit == ResizeUnit.percent) {
       _hCtrl.text = value;
@@ -892,12 +1012,19 @@ class _ResizeSheetState extends State<ResizeSheet> {
           _unit == ResizeUnit.px ? h.round().toString() : h.toStringAsFixed(2);
     }
     _updatingFields = false;
+    setState(() {});
   }
 
   void _onHeightChanged(String value) {
-    if (!_lockAspect || _updatingFields) return;
+    if (!_lockAspect || _updatingFields) {
+      setState(() {});
+      return;
+    }
     final h = double.tryParse(value);
-    if (h == null || h <= 0) return;
+    if (h == null || h <= 0) {
+      setState(() {});
+      return;
+    }
     _updatingFields = true;
     if (_unit == ResizeUnit.percent) {
       _wCtrl.text = value;
@@ -908,6 +1035,7 @@ class _ResizeSheetState extends State<ResizeSheet> {
           _unit == ResizeUnit.px ? w.round().toString() : w.toStringAsFixed(2);
     }
     _updatingFields = false;
+    setState(() {});
   }
 
   (int, int) _computeTargetPixels() {
@@ -941,6 +1069,10 @@ class _ResizeSheetState extends State<ResizeSheet> {
       ResizeUnit.cm => 'cm',
     };
 
+    final (previewW, previewH) = _computeTargetPixels();
+    final bool isVerySmall =
+        previewW > 0 && previewH > 0 && (previewW < 250 || previewH < 120);
+
     return Padding(
       padding: EdgeInsets.only(
         left: 20,
@@ -948,89 +1080,133 @@ class _ResizeSheetState extends State<ResizeSheet> {
         top: 20,
         bottom: MediaQuery.of(context).viewInsets.bottom + 24,
       ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Text(
-            'Resize Image',
-            style: Theme.of(context)
-                .textTheme
-                .titleLarge
-                ?.copyWith(fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 12),
-          SegmentedButton<ResizeUnit>(
-            segments: const [
-              ButtonSegment(value: ResizeUnit.px, label: Text('Pixels')),
-              ButtonSegment(value: ResizeUnit.percent, label: Text('%')),
-              ButtonSegment(value: ResizeUnit.inch, label: Text('Inch')),
-              ButtonSegment(value: ResizeUnit.cm, label: Text('CM')),
-            ],
-            selected: {_unit},
-            onSelectionChanged: (s) => _onUnitChanged(s.first),
-          ),
-          const SizedBox(height: 16),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _wCtrl,
-                  keyboardType:
-                      const TextInputType.numberWithOptions(decimal: true),
-                  onChanged: _onWidthChanged,
-                  decoration: InputDecoration(
-                    labelText: 'Width ($unitSuffix)',
-                    border: const OutlineInputBorder(),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: TextField(
-                  controller: _hCtrl,
-                  keyboardType:
-                      const TextInputType.numberWithOptions(decimal: true),
-                  onChanged: _onHeightChanged,
-                  decoration: InputDecoration(
-                    labelText: 'Height ($unitSuffix)',
-                    border: const OutlineInputBorder(),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          if (_unit == ResizeUnit.inch || _unit == ResizeUnit.cm) ...[
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Resize Image (HD Quality)',
+              style: Theme.of(context)
+                  .textTheme
+                  .titleLarge
+                  ?.copyWith(fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 12),
-            TextField(
-              controller: _dpiCtrl,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'Print Resolution (DPI - Default 300)',
-                border: OutlineInputBorder(),
+            SegmentedButton<ResizeUnit>(
+              segments: const [
+                ButtonSegment(value: ResizeUnit.px, label: Text('Pixels')),
+                ButtonSegment(value: ResizeUnit.percent, label: Text('%')),
+                ButtonSegment(value: ResizeUnit.inch, label: Text('Inch')),
+                ButtonSegment(value: ResizeUnit.cm, label: Text('CM')),
+              ],
+              selected: {_unit},
+              onSelectionChanged: (s) => _onUnitChanged(s.first),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _wCtrl,
+                    keyboardType:
+                        const TextInputType.numberWithOptions(decimal: true),
+                    onChanged: _onWidthChanged,
+                    decoration: InputDecoration(
+                      labelText: 'Width ($unitSuffix)',
+                      border: const OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: TextField(
+                    controller: _hCtrl,
+                    keyboardType:
+                        const TextInputType.numberWithOptions(decimal: true),
+                    onChanged: _onHeightChanged,
+                    decoration: InputDecoration(
+                      labelText: 'Height ($unitSuffix)',
+                      border: const OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            if (_unit == ResizeUnit.inch || _unit == ResizeUnit.cm) ...[
+              const SizedBox(height: 12),
+              TextField(
+                controller: _dpiCtrl,
+                keyboardType: TextInputType.number,
+                onChanged: _onDpiChanged,
+                decoration: const InputDecoration(
+                  labelText: 'Print Resolution (DPI - Default 300)',
+                  helperText:
+                      'Higher DPI (300-600) keeps Inch/CM photos super sharp',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(
+                'Output Resolution: $previewW × $previewH pixels',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+              ),
+            ),
+            if (isVerySmall) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Colors.amber.withOpacity(0.18),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.amber.shade700),
+                ),
+                child: const Text(
+                  'Tip: Ye pixel size (e.g. 140×73 px) form upload ke liye bahut chhota hota hai, isliye full-screen zoom karne par धुंधला dikhta hai. Signature ke liye pehle "Crop Image" se sirf नाम/साइन ke aas-pass crop karein, fir resize karein!',
+                  style: TextStyle(fontSize: 12.5),
+                ),
+              ),
+            ],
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Lock Aspect Ratio'),
+              subtitle: const Text('Photo ko stretch hone se bachaye'),
+              value: _lockAspect,
+              onChanged: (v) => setState(() => _lockAspect = v),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Keep Text & Signature Extra Sharp'),
+              subtitle: const Text(
+                'Unsharp mask + YUV 4:4:4 HD encoding for crisp letters',
+              ),
+              value: _enhanceText,
+              onChanged: (v) => setState(() => _enhanceText = v),
+            ),
+            const SizedBox(height: 8),
+            FilledButton(
+              onPressed: () {
+                final (w, h) = _computeTargetPixels();
+                if (w <= 0 || h <= 0) return;
+                Navigator.pop(context);
+                widget.onApply(w, h, _enhanceText);
+              },
+              child: const Padding(
+                padding: EdgeInsets.symmetric(vertical: 12),
+                child: Text('Resize in HD Now'),
               ),
             ),
           ],
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Lock Aspect Ratio'),
-            value: _lockAspect,
-            onChanged: (v) => setState(() => _lockAspect = v),
-          ),
-          const SizedBox(height: 8),
-          FilledButton(
-            onPressed: () {
-              final (w, h) = _computeTargetPixels();
-              if (w <= 0 || h <= 0) return;
-              Navigator.pop(context);
-              widget.onApply(w, h);
-            },
-            child: const Padding(
-              padding: EdgeInsets.symmetric(vertical: 12),
-              child: Text('Resize Now'),
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -1106,14 +1282,19 @@ class _CropScreenState extends State<CropScreen> {
                   onTap: () => _setRatio(null),
                 ),
                 _RatioChip(
-                  label: '1:1 Square',
-                  selected: _aspectRatio == 1.0,
-                  onTap: () => _setRatio(1.0),
+                  label: 'Signature (140:60)',
+                  selected: _aspectRatio == 140 / 60,
+                  onTap: () => _setRatio(140 / 60),
                 ),
                 _RatioChip(
                   label: 'Passport (3.5:4.5)',
                   selected: _aspectRatio == 3.5 / 4.5,
                   onTap: () => _setRatio(3.5 / 4.5),
+                ),
+                _RatioChip(
+                  label: '1:1 Square',
+                  selected: _aspectRatio == 1.0,
+                  onTap: () => _setRatio(1.0),
                 ),
                 _RatioChip(
                   label: '4:3',
