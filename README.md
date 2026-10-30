@@ -28,16 +28,6 @@ You can download the latest APK directly from the **Releases** section:
 
 ---
 
-## 📸 Screenshots
-
-| Home Screen | Compression | Output Result |
-| :---: | :---: | :---: |
-| *Add Screenshot 1* | *Add Screenshot 2* | *Add Screenshot 3* |
-
-*(Tip: Create a `screenshots` folder in your repo, upload 2-3 images, and link them here)*
-
----
-
 ## 🐛 Found a Bug or Have a Solution? (Feedback & Contributions)
 
 This project is open for community testing and improvements! If you face any crash, bug, or have an idea to make it better:
