@@ -1,7 +1,7 @@
 name: smart_image_tool
-description: A clean Material 3 utility app for Realme 6 to compress, increase size, resize, and crop images in JPG format.
+description: A clean Material 3 utility app for Realme 6 to compress, increase size, resize, and crop images in JPG format using the exact native Android Bitmap.compress & BitmapFactory algorithm.
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.1.0+2
 
 environment:
   sdk: '>=3.2.0 <4.0.0'
